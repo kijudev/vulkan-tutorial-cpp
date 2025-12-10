@@ -73,7 +73,9 @@ class TriangleApplication {
     std::array<VkSemaphore, MAX_FRAMES_IN_FLIGHT>     m_semaphores_image_available = {VK_NULL_HANDLE};
     std::array<VkSemaphore, MAX_FRAMES_IN_FLIGHT>     m_semaphores_render_finished = {VK_NULL_HANDLE};
     std::array<VkFence, MAX_FRAMES_IN_FLIGHT>         m_fences_in_flight           = {VK_NULL_HANDLE};
-    uint32_t                                          m_current_frame              = 0;
+
+    uint32_t m_current_frame       = 0;
+    bool     m_framebuffer_resized = true;
 
     const std::vector<const char*> m_validation_layers = {"VK_LAYER_KHRONOS_validation"};
     const std::vector<const char*> m_device_extensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
@@ -102,13 +104,21 @@ class TriangleApplication {
 
     void init_window() {
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+        glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
         m_window = glfwCreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "triangle", nullptr, nullptr);
         if (!m_window) {
             glfwTerminate();
             throw std::runtime_error("TriangleApplication::init_window => Failed to create GLFW window");
         }
+
+        glfwSetWindowUserPointer(m_window, this);
+        glfwSetFramebufferSizeCallback(m_window, framebuffer_resize_callback);
+    }
+
+    static void framebuffer_resize_callback(GLFWwindow* window, int width, int height) {
+        TriangleApplication* app   = static_cast<TriangleApplication*>(glfwGetWindowUserPointer(window));
+        app->m_framebuffer_resized = true;
     }
 
     void init_vulcan() {
@@ -142,6 +152,12 @@ class TriangleApplication {
     }
 
     void cleanup() {
+        cleanup_swapchain();
+
+        vkDestroyPipeline(m_logical_device, m_graphics_pipeline, nullptr);
+        vkDestroyPipelineLayout(m_logical_device, m_pipeline_layout, nullptr);
+        vkDestroyRenderPass(m_logical_device, m_render_pass, nullptr);
+
         for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
             vkDestroySemaphore(m_logical_device, m_semaphores_image_available[i], nullptr);
             vkDestroySemaphore(m_logical_device, m_semaphores_render_finished[i], nullptr);
@@ -149,27 +165,13 @@ class TriangleApplication {
         }
 
         vkDestroyCommandPool(m_logical_device, m_command_pool, nullptr);
-
-        for (auto& framebuffer : m_swapchain_framebuffers) {
-            vkDestroyFramebuffer(m_logical_device, framebuffer, nullptr);
-        }
-
-        vkDestroyPipeline(m_logical_device, m_graphics_pipeline, nullptr);
-        vkDestroyPipelineLayout(m_logical_device, m_pipeline_layout, nullptr);
-        vkDestroyRenderPass(m_logical_device, m_render_pass, nullptr);
-
-        for (auto image_view : m_swapchain_image_views) {
-            vkDestroyImageView(m_logical_device, image_view, nullptr);
-        }
-
-        vkDestroySwapchainKHR(m_logical_device, m_swapchain, nullptr);
-        vkDestroySurfaceKHR(m_instance, m_surface, nullptr);
         vkDestroyDevice(m_logical_device, nullptr);
 
         if (ENABLE_VALIDATION_LAYERS) {
             proxy_destroy_debug_utils_messenger_ext(m_instance, m_debug_messenger, nullptr);
         }
 
+        vkDestroySurfaceKHR(m_instance, m_surface, nullptr);
         vkDestroyInstance(m_instance, nullptr);
 
         glfwDestroyWindow(m_window);
@@ -995,11 +997,20 @@ class TriangleApplication {
 
     void draw_frame() {
         vkWaitForFences(m_logical_device, 1, &m_fences_in_flight[m_current_frame], VK_TRUE, UINT64_MAX);
-        vkResetFences(m_logical_device, 1, &m_fences_in_flight[m_current_frame]);
 
         uint32_t image_index{};
-        vkAcquireNextImageKHR(m_logical_device, m_swapchain, UINT64_MAX, m_semaphores_image_available[m_current_frame],
-                              VK_NULL_HANDLE, &image_index);
+        VkResult acquire_image_result =
+            vkAcquireNextImageKHR(m_logical_device, m_swapchain, UINT64_MAX,
+                                  m_semaphores_image_available[m_current_frame], VK_NULL_HANDLE, &image_index);
+
+        if (acquire_image_result == VK_ERROR_OUT_OF_DATE_KHR) {
+            recreate_swapchain();
+            return;
+        } else if (acquire_image_result != VK_SUCCESS && acquire_image_result != VK_SUBOPTIMAL_KHR) {
+            throw std::runtime_error("TriangleApplication::draw_frame => failed to acquire next image!");
+        }
+
+        vkResetFences(m_logical_device, 1, &m_fences_in_flight[m_current_frame]);
 
         vkResetCommandBuffer(m_command_buffers[m_current_frame], 0);
         record_command_buffer(m_command_buffers[m_current_frame], image_index);
@@ -1047,7 +1058,14 @@ class TriangleApplication {
         present_info.pImageIndices      = &image_index;
         present_info.pResults           = nullptr;  // Optional
 
-        vkQueuePresentKHR(m_present_queue, &present_info);
+        VkResult queue_present_result = vkQueuePresentKHR(m_present_queue, &present_info);
+        if (queue_present_result == VK_ERROR_OUT_OF_DATE_KHR || queue_present_result == VK_SUBOPTIMAL_KHR ||
+            m_framebuffer_resized) {
+            m_framebuffer_resized = false;
+            recreate_swapchain();
+        } else if (queue_present_result != VK_SUCCESS) {
+            throw std::runtime_error("failed to present swap chain image!");
+        }
 
         m_current_frame = (m_current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
@@ -1071,6 +1089,38 @@ class TriangleApplication {
                     "semaphores!");
             }
         }
+    }
+
+    void recreate_swapchain() {
+        int width = 0, height = 0;
+        glfwGetFramebufferSize(m_window, &width, &height);
+        while (width == 0 || height == 0) {
+            glfwGetFramebufferSize(m_window, &width, &height);
+            glfwWaitEvents();
+        }
+
+        vkDeviceWaitIdle(m_logical_device);
+
+        cleanup_swapchain();
+
+        create_swapchain();
+        create_image_views();
+        create_framebuffers();
+
+        // Not recreating render passes for simplicty
+        // https://vulkan-tutorial.com/Drawing_a_triangle/Swap_chain_recreation
+    }
+
+    void cleanup_swapchain() {
+        for (VkFramebuffer framebuffer : m_swapchain_framebuffers) {
+            vkDestroyFramebuffer(m_logical_device, framebuffer, nullptr);
+        }
+
+        for (VkImageView image_view : m_swapchain_image_views) {
+            vkDestroyImageView(m_logical_device, image_view, nullptr);
+        }
+
+        vkDestroySwapchainKHR(m_logical_device, m_swapchain, nullptr);
     }
 };
 
