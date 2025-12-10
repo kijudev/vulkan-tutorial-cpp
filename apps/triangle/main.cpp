@@ -40,8 +40,9 @@ class SwapChainSupportDetails {
 
 class TriangleApplication {
    private:
-    static constexpr uint32_t WINDOW_WIDTH  = 800;
-    static constexpr uint32_t WINDOW_HEIGHT = 600;
+    static constexpr uint32_t WINDOW_WIDTH         = 800;
+    static constexpr uint32_t WINDOW_HEIGHT        = 600;
+    static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
 
 #ifdef NDEBUG
     static constexpr bool ENABLE_VALIDATION_LAYERS = false;
@@ -67,11 +68,12 @@ class TriangleApplication {
     VkPipeline                 m_graphics_pipeline      = VK_NULL_HANDLE;
     std::vector<VkFramebuffer> m_swapchain_framebuffers = {};
     VkCommandPool              m_command_pool           = VK_NULL_HANDLE;
-    VkCommandBuffer            m_command_buffer         = VK_NULL_HANDLE;
 
-    VkSemaphore m_semaphore_image_available = VK_NULL_HANDLE;
-    VkSemaphore m_semaphore_render_finished = VK_NULL_HANDLE;
-    VkFence     m_fence_in_flight           = VK_NULL_HANDLE;
+    std::array<VkCommandBuffer, MAX_FRAMES_IN_FLIGHT> m_command_buffers            = {VK_NULL_HANDLE};
+    std::array<VkSemaphore, MAX_FRAMES_IN_FLIGHT>     m_semaphores_image_available = {VK_NULL_HANDLE};
+    std::array<VkSemaphore, MAX_FRAMES_IN_FLIGHT>     m_semaphores_render_finished = {VK_NULL_HANDLE};
+    std::array<VkFence, MAX_FRAMES_IN_FLIGHT>         m_fences_in_flight           = {VK_NULL_HANDLE};
+    uint32_t                                          m_current_frame              = 0;
 
     const std::vector<const char*> m_validation_layers = {"VK_LAYER_KHRONOS_validation"};
     const std::vector<const char*> m_device_extensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
@@ -126,7 +128,7 @@ class TriangleApplication {
         create_graphics_pipleline();
         create_framebuffers();
         create_command_pool();
-        create_command_buffer();
+        create_command_buffers();
 
         // Create synchronization objects last so they are available when drawing frames.
         create_synchonization_objects();
@@ -140,9 +142,11 @@ class TriangleApplication {
     }
 
     void cleanup() {
-        vkDestroySemaphore(m_logical_device, m_semaphore_image_available, nullptr);
-        vkDestroySemaphore(m_logical_device, m_semaphore_render_finished, nullptr);
-        vkDestroyFence(m_logical_device, m_fence_in_flight, nullptr);
+        for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            vkDestroySemaphore(m_logical_device, m_semaphores_image_available[i], nullptr);
+            vkDestroySemaphore(m_logical_device, m_semaphores_render_finished[i], nullptr);
+            vkDestroyFence(m_logical_device, m_fences_in_flight[i], nullptr);
+        }
 
         vkDestroyCommandPool(m_logical_device, m_command_pool, nullptr);
 
@@ -926,14 +930,14 @@ class TriangleApplication {
         }
     }
 
-    void create_command_buffer() {
+    void create_command_buffers() {
         VkCommandBufferAllocateInfo command_buffer_allocate_info{};
         command_buffer_allocate_info.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         command_buffer_allocate_info.commandPool        = m_command_pool;
         command_buffer_allocate_info.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        command_buffer_allocate_info.commandBufferCount = 1;
+        command_buffer_allocate_info.commandBufferCount = MAX_FRAMES_IN_FLIGHT;
 
-        if (vkAllocateCommandBuffers(m_logical_device, &command_buffer_allocate_info, &m_command_buffer) !=
+        if (vkAllocateCommandBuffers(m_logical_device, &command_buffer_allocate_info, m_command_buffers.data()) !=
             VK_SUCCESS) {
             throw std::runtime_error(
                 "TriangleApplication::create_command_buffer => failed to allocate command buffer!");
@@ -964,7 +968,7 @@ class TriangleApplication {
         render_pass_begin_info.pClearValues    = &clear_color;
 
         vkCmdBeginRenderPass(command_buffer, &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
-        vkCmdBindPipeline(m_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_graphics_pipeline);
+        vkCmdBindPipeline(m_command_buffers[m_current_frame], VK_PIPELINE_BIND_POINT_GRAPHICS, m_graphics_pipeline);
 
         VkViewport viewport{};
         viewport.x        = 0.0f;
@@ -990,32 +994,32 @@ class TriangleApplication {
     }
 
     void draw_frame() {
-        vkWaitForFences(m_logical_device, 1, &m_fence_in_flight, VK_TRUE, UINT64_MAX);
-        vkResetFences(m_logical_device, 1, &m_fence_in_flight);
+        vkWaitForFences(m_logical_device, 1, &m_fences_in_flight[m_current_frame], VK_TRUE, UINT64_MAX);
+        vkResetFences(m_logical_device, 1, &m_fences_in_flight[m_current_frame]);
 
         uint32_t image_index{};
-        vkAcquireNextImageKHR(m_logical_device, m_swapchain, UINT64_MAX, m_semaphore_image_available, VK_NULL_HANDLE,
-                              &image_index);
+        vkAcquireNextImageKHR(m_logical_device, m_swapchain, UINT64_MAX, m_semaphores_image_available[m_current_frame],
+                              VK_NULL_HANDLE, &image_index);
 
-        vkResetCommandBuffer(m_command_buffer, 0);
-        record_command_buffer(m_command_buffer, image_index);
+        vkResetCommandBuffer(m_command_buffers[m_current_frame], 0);
+        record_command_buffer(m_command_buffers[m_current_frame], image_index);
 
         VkSubmitInfo submit_info{};
         submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 
-        std::array<VkSemaphore, 1>          signal_semaphores = {m_semaphore_render_finished};
-        std::array<VkSemaphore, 1>          wait_semaphores   = {m_semaphore_image_available};
+        std::array<VkSemaphore, 1>          signal_semaphores = {m_semaphores_render_finished[m_current_frame]};
+        std::array<VkSemaphore, 1>          wait_semaphores   = {m_semaphores_image_available[m_current_frame]};
         std::array<VkPipelineStageFlags, 1> wait_stages       = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
 
         submit_info.waitSemaphoreCount   = static_cast<uint32_t>(wait_semaphores.size());
         submit_info.pWaitSemaphores      = wait_semaphores.data();
         submit_info.pWaitDstStageMask    = wait_stages.data();
         submit_info.commandBufferCount   = 1;
-        submit_info.pCommandBuffers      = &m_command_buffer;
+        submit_info.pCommandBuffers      = &m_command_buffers[m_current_frame];
         submit_info.signalSemaphoreCount = static_cast<uint32_t>(signal_semaphores.size());
         submit_info.pSignalSemaphores    = signal_semaphores.data();
 
-        if (vkQueueSubmit(m_graphics_queue, 1, &submit_info, m_fence_in_flight) != VK_SUCCESS) {
+        if (vkQueueSubmit(m_graphics_queue, 1, &submit_info, m_fences_in_flight[m_current_frame]) != VK_SUCCESS) {
             throw std::runtime_error("TriangleApplication::draw_frame => failed to submit draw command buffer!");
         }
 
@@ -1044,6 +1048,8 @@ class TriangleApplication {
         present_info.pResults           = nullptr;  // Optional
 
         vkQueuePresentKHR(m_present_queue, &present_info);
+
+        m_current_frame = (m_current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 
     void create_synchonization_objects() {
@@ -1054,14 +1060,16 @@ class TriangleApplication {
         fence_create_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         fence_create_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-        if (vkCreateSemaphore(m_logical_device, &semaphore_create_info, nullptr, &m_semaphore_image_available) !=
-                VK_SUCCESS ||
-            vkCreateSemaphore(m_logical_device, &semaphore_create_info, nullptr, &m_semaphore_render_finished) !=
-                VK_SUCCESS ||
-            vkCreateFence(m_logical_device, &fence_create_info, nullptr, &m_fence_in_flight) != VK_SUCCESS) {
-            throw std::runtime_error(
-                "TriangleApplication::create_synchonization_objects => failed to create "
-                "semaphores!");
+        for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            if (vkCreateSemaphore(m_logical_device, &semaphore_create_info, nullptr,
+                                  &m_semaphores_image_available[i]) != VK_SUCCESS ||
+                vkCreateSemaphore(m_logical_device, &semaphore_create_info, nullptr,
+                                  &m_semaphores_render_finished[i]) != VK_SUCCESS ||
+                vkCreateFence(m_logical_device, &fence_create_info, nullptr, &m_fences_in_flight[i]) != VK_SUCCESS) {
+                throw std::runtime_error(
+                    "TriangleApplication::create_synchonization_objects => failed to create "
+                    "semaphores!");
+            }
         }
     }
 };
