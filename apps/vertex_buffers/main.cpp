@@ -71,8 +71,10 @@ class TriangleApplication {
 
     std::array<VkCommandBuffer, MAX_FRAMES_IN_FLIGHT> m_command_buffers            = {VK_NULL_HANDLE};
     std::array<VkSemaphore, MAX_FRAMES_IN_FLIGHT>     m_semaphores_image_available = {VK_NULL_HANDLE};
-    std::array<VkSemaphore, MAX_FRAMES_IN_FLIGHT>     m_semaphores_render_finished = {VK_NULL_HANDLE};
+    std::vector<VkSemaphore>                          m_semaphores_render_finished = {};
     std::array<VkFence, MAX_FRAMES_IN_FLIGHT>         m_fences_in_flight           = {VK_NULL_HANDLE};
+
+    std::vector<VkFence> m_images_in_flight;
 
     uint32_t m_current_frame       = 0;
     bool     m_framebuffer_resized = true;
@@ -119,6 +121,9 @@ class TriangleApplication {
     static void framebuffer_resize_callback(GLFWwindow* window, int width, int height) {
         TriangleApplication* app   = static_cast<TriangleApplication*>(glfwGetWindowUserPointer(window));
         app->m_framebuffer_resized = true;
+
+        (void)width;
+        (void)height;
     }
 
     void init_vulcan() {
@@ -149,6 +154,12 @@ class TriangleApplication {
     }
 
     void cleanup() {
+        // Wait until the device is idle before destroying resources to ensure no commands are
+        // still referencing swapchain images, semaphores, fences, framebuffers, etc.
+        if (m_logical_device != VK_NULL_HANDLE) {
+            vkDeviceWaitIdle(m_logical_device);
+        }
+
         cleanup_swapchain();
 
         vkDestroyPipeline(m_logical_device, m_graphics_pipeline, nullptr);
@@ -157,7 +168,6 @@ class TriangleApplication {
 
         for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
             vkDestroySemaphore(m_logical_device, m_semaphores_image_available[i], nullptr);
-            vkDestroySemaphore(m_logical_device, m_semaphores_render_finished[i], nullptr);
             vkDestroyFence(m_logical_device, m_fences_in_flight[i], nullptr);
         }
 
@@ -285,6 +295,23 @@ class TriangleApplication {
 
         m_swapchain_format = surface_format.format;
         m_swapchain_extent = extent;
+
+        // Ensure we have one "in-flight" fence slot per swapchain image to avoid semaphore reuse
+        // races. Initialize to VK_NULL_HANDLE meaning that image is not currently in-flight.
+        m_images_in_flight.resize(image_count, VK_NULL_HANDLE);
+
+        // Create one render-finished semaphore per swapchain image. These semaphores are used
+        // to signal that rendering to a particular swapchain image has finished before presenting.
+        m_semaphores_render_finished.resize(image_count, VK_NULL_HANDLE);
+        VkSemaphoreCreateInfo semaphore_create_info{};
+        semaphore_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        for (uint32_t i = 0; i < image_count; ++i) {
+            if (vkCreateSemaphore(m_logical_device, &semaphore_create_info, nullptr,
+                                  &m_semaphores_render_finished[i]) != VK_SUCCESS) {
+                throw std::runtime_error(
+                    "TriangleApplication::create_swapchain => failed to create render-finished semaphore!");
+            }
+        }
     }
 
     void check_extension_support() {
@@ -1007,6 +1034,15 @@ class TriangleApplication {
             throw std::runtime_error("TriangleApplication::draw_frame => failed to acquire next image!");
         }
 
+        // If this image is already in flight (used by a previous frame), wait for that fence
+        // to ensure the image is available and the semaphores/fences are not still in use.
+        if (!m_images_in_flight.empty() && m_images_in_flight[image_index] != VK_NULL_HANDLE) {
+            vkWaitForFences(m_logical_device, 1, &m_images_in_flight[image_index], VK_TRUE, UINT64_MAX);
+        }
+
+        // Mark this image as now being in use by the current frame's fence.
+        m_images_in_flight[image_index] = m_fences_in_flight[m_current_frame];
+
         vkResetFences(m_logical_device, 1, &m_fences_in_flight[m_current_frame]);
 
         vkResetCommandBuffer(m_command_buffers[m_current_frame], 0);
@@ -1015,9 +1051,16 @@ class TriangleApplication {
         VkSubmitInfo submit_info{};
         submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 
-        std::array<VkSemaphore, 1>          signal_semaphores = {m_semaphores_render_finished[m_current_frame]};
-        std::array<VkSemaphore, 1>          wait_semaphores   = {m_semaphores_image_available[m_current_frame]};
-        std::array<VkPipelineStageFlags, 1> wait_stages       = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+        std::array<VkSemaphore, 1>          wait_semaphores = {m_semaphores_image_available[m_current_frame]};
+        std::array<VkPipelineStageFlags, 1> wait_stages     = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+
+        // Use the render-finished semaphore dedicated to the acquired swapchain image.
+        VkSemaphore render_finished_semaphore = VK_NULL_HANDLE;
+        if (!m_semaphores_render_finished.empty()) {
+            render_finished_semaphore = m_semaphores_render_finished[image_index];
+        }
+
+        std::array<VkSemaphore, 1> signal_semaphores = {render_finished_semaphore};
 
         submit_info.waitSemaphoreCount   = static_cast<uint32_t>(wait_semaphores.size());
         submit_info.pWaitSemaphores      = wait_semaphores.data();
@@ -1048,12 +1091,13 @@ class TriangleApplication {
 
         VkPresentInfoKHR present_info{};
         present_info.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-        present_info.waitSemaphoreCount = static_cast<uint32_t>(signal_semaphores.size());
-        present_info.pWaitSemaphores    = signal_semaphores.data();
-        present_info.swapchainCount     = static_cast<uint32_t>(swapchains.size());
-        present_info.pSwapchains        = swapchains.data();
-        present_info.pImageIndices      = &image_index;
-        present_info.pResults           = nullptr;  // Optional
+        present_info.waitSemaphoreCount = (render_finished_semaphore == VK_NULL_HANDLE) ? 0u : 1u;
+        present_info.pWaitSemaphores =
+            (render_finished_semaphore == VK_NULL_HANDLE) ? nullptr : &render_finished_semaphore;
+        present_info.swapchainCount = static_cast<uint32_t>(swapchains.size());
+        present_info.pSwapchains    = swapchains.data();
+        present_info.pImageIndices  = &image_index;
+        present_info.pResults       = nullptr;  // Optional
 
         VkResult queue_present_result = vkQueuePresentKHR(m_present_queue, &present_info);
         if (queue_present_result == VK_ERROR_OUT_OF_DATE_KHR || queue_present_result == VK_SUBOPTIMAL_KHR ||
@@ -1078,12 +1122,9 @@ class TriangleApplication {
         for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
             if (vkCreateSemaphore(m_logical_device, &semaphore_create_info, nullptr,
                                   &m_semaphores_image_available[i]) != VK_SUCCESS ||
-                vkCreateSemaphore(m_logical_device, &semaphore_create_info, nullptr,
-                                  &m_semaphores_render_finished[i]) != VK_SUCCESS ||
                 vkCreateFence(m_logical_device, &fence_create_info, nullptr, &m_fences_in_flight[i]) != VK_SUCCESS) {
                 throw std::runtime_error(
-                    "TriangleApplication::create_synchonization_objects => failed to create "
-                    "semaphores!");
+                    "TriangleApplication::create_synchonization_objects => failed to create semaphores or fences!");
             }
         }
     }
@@ -1116,6 +1157,14 @@ class TriangleApplication {
         for (VkImageView image_view : m_swapchain_image_views) {
             vkDestroyImageView(m_logical_device, image_view, nullptr);
         }
+
+        // Destroy per-swapchain-image render-finished semaphores.
+        for (VkSemaphore sem : m_semaphores_render_finished) {
+            if (sem != VK_NULL_HANDLE) {
+                vkDestroySemaphore(m_logical_device, sem, nullptr);
+            }
+        }
+        m_semaphores_render_finished.clear();
 
         vkDestroySwapchainKHR(m_logical_device, m_swapchain, nullptr);
     }
