@@ -1,5 +1,5 @@
 CXX      := clang++
-CXXOPT   := -g -O0 -fno-omit-frame-pointer -fno-optimize-sibling-calls -DDEBUG
+CXXOPT   := -g -O1 -fno-omit-frame-pointer -fno-optimize-sibling-calls -DDEBUG
 CXXFLAGS := -std=c++23 -Wall -Wextra -Iinclude
 
 PKG_CONFIG := pkg-config
