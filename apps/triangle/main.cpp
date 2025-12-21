@@ -93,7 +93,7 @@ class TriangleApplication {
     void init() {
         init_glfw();
         init_window();
-        init_vulcan();
+        init_vulkan();
     }
 
     void init_glfw() {
@@ -121,7 +121,7 @@ class TriangleApplication {
         app->m_framebuffer_resized = true;
     }
 
-    void init_vulcan() {
+    void init_vulkan() {
         create_instance();
         check_extension_support();
         setup_debug_messenger();

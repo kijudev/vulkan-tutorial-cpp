@@ -90,12 +90,10 @@ class TriangleApplication {
     }
 
    private:
-    /* ---- Initialization and lifecycle ---- */
-
     void init() {
         init_glfw();
         init_window();
-        init_vulcan();
+        init_vulkan();
     }
 
     void init_glfw() {
@@ -126,7 +124,7 @@ class TriangleApplication {
         (void)height;
     }
 
-    void init_vulcan() {
+    void init_vulkan() {
         create_instance();
         check_extension_support();
         setup_debug_messenger();
@@ -1144,9 +1142,6 @@ class TriangleApplication {
         create_swapchain();
         create_image_views();
         create_framebuffers();
-
-        // Not recreating render passes for simplicty
-        // https://vulkan-tutorial.com/Drawing_a_triangle/Swap_chain_recreation
     }
 
     void cleanup_swapchain() {
